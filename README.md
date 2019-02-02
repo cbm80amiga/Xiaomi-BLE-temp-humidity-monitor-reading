@@ -9,3 +9,7 @@ Supported advertisement packets:
 
 YouTube video:
 https://youtu.be/pyhpXnFzNhU
+
+Update: Now humidity can be reconstructed from T+H message and previous value
+New version of the project for 32x8 LED Matrix is available too
+
