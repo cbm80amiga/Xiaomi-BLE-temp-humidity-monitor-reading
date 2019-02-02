@@ -1,7 +1,4 @@
-#include <SPI.h>
-#include <RF24.h>
-RF24 radio(9,10);
-
+// Reading Xiaomi Mi BLE Temperature & Humidity Monitor
 // Code for the video: https://youtu.be/pyhpXnFzNhU
 // (C)2019 Pawel A. Hernik
 // BLE code based on Dmitry Grinberg and Florian Echtler work
@@ -30,6 +27,10 @@ RF24 radio(9,10);
  http://arduinoinfo.mywikis.net/wiki/Nrf24L01-2.4GHz-HowTo#po1
 */
 
+#include <SPI.h>
+#include <RF24.h>
+RF24 radio(9,10);
+
 #include <OLEDSoftI2C_SSD1306.h>
 //#include <OLEDSoftI2C_SH1106.h>
 // define USEHW in above header for hw I2C version
@@ -41,6 +42,15 @@ int oled128x32 = 0;
 #include "term8x10_font.h"
 #include "small5x7_font.h"
 #include "chicago_th_font.h"
+
+// 0 - no debug on OLED
+// 1 - packet counter/message type only
+// 2 - full info with message timers
+int debug = 2;
+
+// serial debug - all packets dump
+int sdebug = 1;
+
 
 // -------------------------
 
@@ -178,13 +188,16 @@ char buf[100];
 int temp=-1000;
 int hum=-1;
 int bat=-1;
-int x,cnt,mode,v1,v10;
+int x,cnt=0,mode=0,v1,v10;
 int tempOld=-123;
 int humOld=-123;
 int batOld=-123;
 int cntOld = -1;
-unsigned long tm=0;
-char *modeTxt;
+unsigned long tmT=0;
+unsigned long tmH=0;
+unsigned long tmB=0;
+unsigned long tmD=0;
+char *modeTxt="";
 
 // Xiaomi advertisement packet decoding
 //          18       21 22 23 24
@@ -192,6 +205,8 @@ char *modeTxt;
 // a8 65 4c 0d 10 04 da 00 de 01  -> temperature+humidity
 //          mm       hl hh
 // a8 65 4c 06 10 04 da 01        -> humidity
+//          mm       tl th
+// a8 65 4c 04 10 04 db 00        -> temperature
 //          mm       bb 
 // a8 75 4c 0a 10 01 60           -> battery
 // 75 e7 f7 e5 bf 23 e3 20 0d 00  -> ???
@@ -203,52 +218,70 @@ void loop()
 {
   receiveBLE(100);
   uint8_t *recv = buffer.payload;
-  //if(buffer.mac[5]==0x4c && buffer.mac[0]==0xe)  // my Xiaomi MAC address (1st and last number only)
+  //if(buffer.mac[5]==0x4c && buffer.mac[0]==0xe)  // limit to my Xiaomi MAC address (1st and last number only)
   if(recv[5]==0x95 && recv[6]==0xfe && recv[7]==0x50 && recv[8]==0x20)
   {
     cnt=recv[11];
     mode=recv[18];
     int mesSize=recv[3];
     int plSize=buffer.payloadSize-6;
-    if(mode==0x0d && plSize==25) { // temperature + humidity (missing msb, so cannot be used)
+    if(mode==0x0d && plSize==25) { // temperature + humidity (missing msb, lsb is reconstructed from previous value)
       temp=recv[21]+recv[22]*256;
       modeTxt="TH";
-      snprintf(buf,100,"#%02x %02x %s %02x %3d'C (%3d%%)",cnt,mode,modeTxt,recv[3],recv[21]+recv[22]*256,recv[23]);
+      if(sdebug) snprintf(buf,100,"#%02x %02x %s %02x %3d'C (%3d%%)",cnt,mode,modeTxt,recv[3],recv[21]+recv[22]*256,recv[23]);
+      if(humOld>0) {  // reconstructing humidity from previous value and new lsb
+        hum = (humOld & ~0xff) | recv[23];
+        if(hum-humOld>128) hum -= 256; else
+        if(humOld-hum>128) hum += 256;
+        tmH = millis();
+      }
+      tmT = millis();
     } else if(mode==0x04 && plSize==23) {  // temperature
       temp=recv[21]+recv[22]*256;
       modeTxt="T ";
-      snprintf(buf,100,"#%02x %02x %s %02x %3d'C       ",cnt,mode,modeTxt,recv[3],recv[21]+recv[22]*256);
+      if(sdebug) snprintf(buf,100,"#%02x %02x %s %02x %3d'C       ",cnt,mode,modeTxt,recv[3],recv[21]+recv[22]*256);
+      tmT = millis();
     } else if(mode==0x06 && plSize==23) {  // humidity
       hum=recv[21]+recv[22]*256;
       modeTxt="H ";
-      snprintf(buf,100,"#%02x %02x %s %02x %3d%%        ",cnt,mode,modeTxt,recv[3],recv[21]+recv[22]*256);
+      if(sdebug) snprintf(buf,100,"#%02x %02x %s %02x %3d%%        ",cnt,mode,modeTxt,recv[3],recv[21]+recv[22]*256);
+      tmH = millis();
     } else if(mode==0x0a && plSize==22) {  // battery level
       bat=recv[21];
       modeTxt="B ";
-      snprintf(buf,100,"#%02x %02x %s %02x %03d%% batt   ",cnt,mode,modeTxt,recv[3],recv[21]);
+      if(sdebug) snprintf(buf,100,"#%02x %02x %s %02x %03d%% batt   ",cnt,mode,modeTxt,recv[3],recv[21]);
+      tmB = millis();
     } else {
       modeTxt="??";
-      snprintf(buf,100,"!!!!!!%02x %02x %s %02x %03d %03d",cnt,mode,modeTxt,recv[3],recv[21],recv[22]);
+      if(sdebug) snprintf(buf,100,"!!!!!!%02x %02x %s %02x %03d %03d",cnt,mode,modeTxt,recv[3],recv[21],recv[22]);
     }
-    Serial.print(buf); 
-    snprintf(buf,100,"  [%02x:%02x:%02x:%02x:%02x:%02x] ch%d s=%02d: ",buffer.mac[5],buffer.mac[4],buffer.mac[3],buffer.mac[2],buffer.mac[1],buffer.mac[0],currentChan,plSize);
-    Serial.print(buf);
-    int n = plSize<=24?plSize:24;
-    for(uint8_t i=0; i<n; i++) { snprintf(buf,100,"%02x ",buffer.payload[i]); Serial.print(buf); }
-    Serial.println();
+    if(sdebug) {
+      Serial.print(buf);
+      snprintf(buf,100,"  [%02x:%02x:%02x:%02x:%02x:%02x] ch%d s=%02d: ",buffer.mac[5],buffer.mac[4],buffer.mac[3],buffer.mac[2],buffer.mac[1],buffer.mac[0],currentChan,plSize);
+      Serial.print(buf);
+      int n = plSize<=24?plSize:24;
+      for(uint8_t i=0; i<n; i++) { snprintf(buf,100,"%02x ",buffer.payload[i]); Serial.print(buf); }
+      Serial.println();
+    }
   }
   hopChannel();
 
+  oled.setFont(Small5x7PL);
+  oled.setDigitMinWd(5);
+  // ble message timers
+  if(millis()-tmD>1000 && debug>1) {
+    tmD = millis();
+    snprintf(buf,100,"%3ld",(millis()-tmT)/1000); oled.printStr(ALIGN_RIGHT, 3, buf);
+    snprintf(buf,100,"%3ld",(millis()-tmH)/1000); oled.printStr(ALIGN_RIGHT, 6, buf);
+    snprintf(buf,100,"%3ld",(millis()-tmB)/1000); oled.printStr(56, 0, buf);
+  }
+
+  // ble message counter & type
   if(cntOld!=cnt) {
     cntOld=cnt;
-    oled.setFont(Small5x7PL);
-    oled.setDigitMinWd(5);
-    snprintf(buf,100,"#%02x %ds  ",cnt,(millis()-tm)/1000);
-    oled.printStr(ALIGN_LEFT, 0, buf);
-    snprintf(buf,100,"<%02x>",mode);
-    oled.printStr(ALIGN_LEFT, 1, buf);
+    snprintf(buf,100,"#%02x",cnt); oled.printStr(ALIGN_LEFT, 0, buf);
+    snprintf(buf,100,"<%02x>",mode); oled.printStr(ALIGN_LEFT, 1, buf);
     oled.printStr(24, 1, modeTxt);
-    tm=millis();
   }
 
   if(tempOld==temp && humOld==hum && batOld==bat) return;
@@ -260,7 +293,7 @@ void loop()
   if(bat<0 || bat>100)
      strcpy(buf," --");
   else {
-    snprintf(buf,100," %2d",bat);
+    snprintf(buf,100,"%3d",bat);
   }
   int wd = oled.strWidth(buf);
   oled.printStr(128-18-wd-6-4, 0, buf);
